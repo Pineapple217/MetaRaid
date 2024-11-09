@@ -1,0 +1,16 @@
+version: "3"
+services:
+  keydb:
+    image: eqalpha/keydb:alpine_x86_64_v6.3.4
+    container_name: keydb
+    command: keydb-server /etc/keydb/redis.conf --server-threads 2
+    volumes:
+      # - ./redis.conf:/etc/keydb/redis.conf
+      - data:/data
+    ports:
+      - 6379:6379
+    restart: unless-stopped
+
+volumes:
+  data:
+    driver: local
