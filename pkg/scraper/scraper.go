@@ -69,14 +69,9 @@ func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scrape
 func (s *Scraper) Start() {
 	slog.Info("Starting scraper")
 	ctx := context.Background()
-	// err := database.RecoverInProgressTasks(s.RDB, ctx)
-	// helper.MaybeDieErr(err)
-	// err = database.EnsureSeedJob(s.RDB, ctx, s.Config.SeedArtistId)
-	err := database.AddJobs(s.RDB, ctx, []spotify.ID{spotify.ID(s.Config.SeedArtistId)})
+	err := database.RecoverInProgressTasks(s.RDB, ctx)
 	helper.MaybeDieErr(err)
-	err = database.AddJobs(s.RDB, ctx, []spotify.ID{spotify.ID(s.Config.SeedArtistId)})
-	helper.MaybeDieErr(err)
-	err = database.AddJobs(s.RDB, ctx, []spotify.ID{spotify.ID(s.Config.SeedArtistId)})
+	err = database.EnsureSeedJob(s.RDB, ctx, s.Config.SeedArtistId)
 	helper.MaybeDieErr(err)
 	go s.fetchJobs()
 	go s.run()
@@ -133,7 +128,10 @@ func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
 				atomic.AddInt64(&w.requestCount, int64(c))
 				atomic.AddInt64(&w.trackCount, int64(len(fs)))
 
-				database.MarkJobDone(w.rdb, ctx, job)
+				err = database.MarkJobDone(w.rdb, ctx, job)
+				if err != nil {
+					w.logger.Error("Failed to mark job as done", "job", job)
+				}
 			}
 		}
 	}()

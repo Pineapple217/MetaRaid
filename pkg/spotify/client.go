@@ -118,7 +118,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 			ids[i] = a.ID
 		}
 
-		f, err := client.GetAudioFeatures(ctx, ids...)
+		features, err := client.GetAudioFeatures(ctx, ids...)
 		if err != nil {
 			return nil, requestCount, err
 		}
@@ -136,7 +136,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 		for i := range len(ids) {
 			allTracks[i+offset] = &FullerTrack{
 				Track:    fullTracks[i],
-				Features: f[i],
+				Features: features[i],
 			}
 		}
 		offset += 100
