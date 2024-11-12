@@ -1,9 +1,7 @@
 package spotify
 
 import (
-	"bytes"
-	"encoding/gob"
-
+	"github.com/vmihailenco/msgpack/v5"
 	"github.com/zmb3/spotify/v2"
 )
 
@@ -13,10 +11,6 @@ type FullerTrack struct {
 }
 
 func (f *FullerTrack) Serialize() ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(f); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	b, err := msgpack.Marshal(f)
+	return b, err
 }

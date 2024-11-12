@@ -1,14 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/gob"
-	"log"
 	"log/slog"
-	"net/http"
 	_ "net/http/pprof"
 	"time"
 
@@ -18,12 +14,10 @@ import (
 	"github.com/Pineapple217/MetaRaid/pkg/spotify"
 	"github.com/marcboeker/go-duckdb"
 	"github.com/redis/go-redis/v9"
+	"github.com/vmihailenco/msgpack"
 )
 
 func main() {
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
 	ctx := context.Background()
 
 	conf, err := config.Load()
@@ -96,10 +90,8 @@ func Export(conn driver.Conn, rdb *redis.Client, ctx context.Context) error {
 			b, err := a.Bytes()
 			helper.MaybeDieErr(err)
 			var record spotify.FullerTrack
-			decoder := gob.NewDecoder(bytes.NewReader(b))
-			if err := decoder.Decode(&record); err != nil {
-				panic(err)
-			}
+			err = msgpack.Unmarshal(b, &record)
+			helper.MaybeDieErr(err)
 			if record.Features == nil {
 				slog.Warn("track has no features", "id", record.Track.ID.String(), "aa", record.Track.Name+"-"+record.Track.Artists[0].Name)
 				continue
