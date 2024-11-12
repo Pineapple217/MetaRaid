@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"log/slog"
-	_ "net/http/pprof"
 	"time"
 
 	"github.com/Pineapple217/MetaRaid/pkg/config"
