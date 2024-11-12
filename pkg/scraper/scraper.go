@@ -69,9 +69,14 @@ func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scrape
 func (s *Scraper) Start() {
 	slog.Info("Starting scraper")
 	ctx := context.Background()
-	err := database.RecoverInProgressTasks(s.RDB, ctx)
+	// err := database.RecoverInProgressTasks(s.RDB, ctx)
+	// helper.MaybeDieErr(err)
+	// err = database.EnsureSeedJob(s.RDB, ctx, s.Config.SeedArtistId)
+	err := database.AddJobs(s.RDB, ctx, []spotify.ID{spotify.ID(s.Config.SeedArtistId)})
 	helper.MaybeDieErr(err)
-	err = database.EnsureSeedTask(s.RDB, ctx, s.Config.SeedArtistId)
+	err = database.AddJobs(s.RDB, ctx, []spotify.ID{spotify.ID(s.Config.SeedArtistId)})
+	helper.MaybeDieErr(err)
+	err = database.AddJobs(s.RDB, ctx, []spotify.ID{spotify.ID(s.Config.SeedArtistId)})
 	helper.MaybeDieErr(err)
 	go s.fetchJobs()
 	go s.run()
@@ -101,24 +106,34 @@ func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
 	}()
 	go func() {
 		defer wg.Done()
-		for job := range jobs {
+		for {
 			select {
 			case <-w.ctx.Done():
 				w.logger.Info("stopped worker")
 				return
 			default:
+				if len(jobs) == 0 {
+					time.Sleep(time.Second)
+					continue
+				}
+				job := <-jobs
 				w.logger.Info("working", "job", job)
 				ctx := context.Background()
 				fs, c, err := spt.FetchArtistTracks(w.client, ctx, spotify.ID(job))
 				helper.MaybeDie(err, "Failed to ferch artists tracks")
 				w.logger.Info("tracks fetched", "artist", job, "count", len(fs), "request_count", c)
 
+				err = database.InsertTracks(w.rdb, ctx, fs)
+				helper.MaybeDie(err, "Failed to add tracks")
+
 				as := spt.GetArtists(fs, spotify.ID(job))
-				err = database.AddTasks(w.rdb, ctx, as)
+				err = database.AddJobs(w.rdb, ctx, as)
 				helper.MaybeDie(err, "Failed to add tasks")
 
 				atomic.AddInt64(&w.requestCount, int64(c))
 				atomic.AddInt64(&w.trackCount, int64(len(fs)))
+
+				database.MarkJobDone(w.rdb, ctx, job)
 			}
 		}
 	}()
@@ -144,9 +159,15 @@ func (s *Scraper) fetchJobs() {
 				time.Sleep(time.Second)
 				continue
 			}
-			tasks, err := database.GetTasks(s.RDB, ctx, 5)
+			tasks, err := database.PopJobs(s.RDB, ctx, 5)
 			if err != nil {
 				slog.Warn("failed to fetch tasks", "error", err)
+			}
+			if len(tasks) == 0 {
+				slog.Info("no jobs to fetch, waiting", "sec", 3)
+				time.Sleep(time.Second * 3)
+			} else {
+				slog.Info("adding tracks to task queue", "count", len(tasks))
 			}
 			for _, task := range tasks {
 				s.Jobs <- task
