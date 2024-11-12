@@ -13,7 +13,7 @@ import (
 	"github.com/Pineapple217/MetaRaid/pkg/spotify"
 	"github.com/marcboeker/go-duckdb"
 	"github.com/redis/go-redis/v9"
-	"github.com/vmihailenco/msgpack"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func main() {
