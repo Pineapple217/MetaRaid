@@ -14,6 +14,7 @@ import (
 	"github.com/marcboeker/go-duckdb"
 	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
+	s "github.com/zmb3/spotify/v2"
 )
 
 func main() {
@@ -45,6 +46,14 @@ func main() {
 		CREATE TABLE IF NOT EXISTS tracks (
 			track_id STRING,
 			name STRING,
+			artis STRING,
+			album STRING,
+			album_type STRING,
+			release_date DATE,
+			image_l STRING,
+			image_m STRING,
+			image_s STRING,
+
 			popularity INTEGER,
 			acousticness FLOAT,
 			danceability FLOAT,
@@ -52,11 +61,33 @@ func main() {
 			instrumentalness FLOAT,
 			liveness FLOAT,
 			speechiness FLOAT,
-			valence FLOAT
+			valence FLOAT,
+			key INTEGER,
+			mode INTEGER,
+			tempo FLOAT,
+			time_signature INTEGER,
+			loudness FLOAT,
+			duration INTEGER,
+
+			explicit BOOLEAN,
+			preview_url STRING,
+			type STRING,
+			 -- playable BOOLEAN,
 		)
 	`)
 	if err != nil {
-		slog.Error("failed to create table", slog.Any("error", err))
+		slog.Error("failed to create table 'tracks'", slog.Any("error", err))
+		return
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS tracks_parts (
+			track_id STRING,
+			name STRING,
+			artis STRING,
+		)
+	`)
+	if err != nil {
+		slog.Error("failed to create table 'tracks_parts'", slog.Any("error", err))
 		return
 	}
 
@@ -78,6 +109,9 @@ func Export(conn driver.Conn, rdb *redis.Client, ctx context.Context) error {
 	appender, err := duckdb.NewAppenderFromConn(conn, "", "tracks")
 	helper.MaybeDieErr(err)
 	defer appender.Close()
+	appenderPart, err := duckdb.NewAppenderFromConn(conn, "", "tracks_parts")
+	helper.MaybeDieErr(err)
+	defer appenderPart.Close()
 	for {
 		keys, newCursor, err := rdb.Scan(ctx, cursor, prefix+"*", batchSize).Result()
 		helper.MaybeDieErr(err)
@@ -92,12 +126,25 @@ func Export(conn driver.Conn, rdb *redis.Client, ctx context.Context) error {
 			err = msgpack.Unmarshal(b, &record)
 			helper.MaybeDieErr(err)
 			if record.Features == nil {
-				slog.Warn("track has no features", "id", record.Track.ID.String(), "aa", record.Track.Name+"-"+record.Track.Artists[0].Name)
+				err = appenderPart.AppendRow(
+					record.Track.ID.String(),
+					record.Track.Name,
+					record.Track.Artists[0].Name,
+				)
+				helper.MaybeDieErr(err)
 				continue
 			}
 			err = appender.AppendRow(
 				record.Track.ID.String(),
 				record.Track.Name,
+				record.Track.Artists[0].Name,
+				record.Track.Album.Name,
+				record.Track.Album.AlbumType,
+				record.Track.Album.ReleaseDateTime(),
+				GetImage(record.Track.Album.Images, 0),
+				GetImage(record.Track.Album.Images, 1),
+				GetImage(record.Track.Album.Images, 2),
+
 				int32(record.Track.Popularity),
 				record.Features.Acousticness,
 				record.Features.Danceability,
@@ -106,6 +153,17 @@ func Export(conn driver.Conn, rdb *redis.Client, ctx context.Context) error {
 				record.Features.Liveness,
 				record.Features.Speechiness,
 				record.Features.Valence,
+				int32(record.Features.Key),
+				int32(record.Features.Mode),
+				record.Features.Tempo,
+				int32(record.Features.TimeSignature),
+				record.Features.Loudness,
+				int32(record.Features.Duration),
+
+				record.Track.Explicit,
+				record.Track.PreviewURL,
+				record.Track.Type,
+				// record.Track.IsPlayable,
 			)
 			helper.MaybeDieErr(err)
 		}
@@ -116,4 +174,11 @@ func Export(conn driver.Conn, rdb *redis.Client, ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func GetImage(imgs []s.Image, i int) string {
+	if len(imgs) > i {
+		return imgs[i].URL
+	}
+	return ""
 }
