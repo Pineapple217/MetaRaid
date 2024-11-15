@@ -13,6 +13,9 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+// temp fix until merge and release
+replace github.com/zmb3/spotify/v2 => github.com/Pineapple217/spotify/v2 v2.4.4
+
 require (
 	github.com/apache/arrow-go/v18 v18.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

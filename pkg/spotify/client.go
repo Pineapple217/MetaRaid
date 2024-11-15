@@ -2,7 +2,6 @@ package spotify
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"slices"
 
@@ -28,7 +27,11 @@ func NewClient(conf config.Spotify) []*spotify.Client {
 		}
 
 		httpClient := spotifyauth.New().Client(ctx, token)
-		client := spotify.New(httpClient, spotify.WithRetry(true))
+		client := spotify.New(
+			httpClient,
+			spotify.WithRetry(true),
+			spotify.WithMaxRetryDuration(conf.MaxRetryDuration),
+		)
 		clients = append(clients, client)
 	}
 	slog.Info("Loaded Spotify api keys", "count", len(clients))
@@ -65,7 +68,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 			// spotify.AlbumTypeAppearsOn,
 		}, spotify.Limit(50))
 	if err != nil {
-		return nil, requestCount, fmt.Errorf("hier %s", err)
+		return nil, requestCount, err
 	}
 	requestCount++
 

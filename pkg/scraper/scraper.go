@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Pineapple217/MetaRaid/pkg/config"
@@ -33,9 +35,20 @@ type Worker struct {
 	logger       *slog.Logger
 	rdb          *redis.Client
 	ctx          context.Context
+	cancel       context.CancelFunc
 	requestCount int64
 	trackCount   int64
+	status       status
 }
+
+type status int
+
+const (
+	initialized status = iota
+	running
+	coldKey
+	stopped
+)
 
 func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scraper) *Scraper {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -44,12 +57,15 @@ func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scrape
 	for i, c := range clients {
 		name := fmt.Sprintf("%d", i)
 		logger := slog.With(slog.Group("worker"), slog.String("id", name))
+		workerCtx, workerCancel := context.WithCancel(ctx)
 		ws = append(ws, &Worker{
 			client: c,
 			id:     name,
 			logger: logger,
 			rdb:    rdb,
-			ctx:    ctx,
+			ctx:    workerCtx,
+			cancel: workerCancel,
+			status: initialized,
 		})
 	}
 
@@ -74,7 +90,8 @@ func (s *Scraper) Start() {
 	err = database.EnsureSeedJob(s.RDB, ctx, s.Config.SeedArtistId)
 	helper.MaybeDieErr(err)
 	go s.fetchJobs()
-	go s.run()
+	go s.runWorkers()
+	go s.workerManage()
 }
 
 func (s *Scraper) Stop() {
@@ -84,6 +101,10 @@ func (s *Scraper) Stop() {
 }
 
 func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
+	if w.status != initialized {
+		slog.Warn("Can not start worker, incorrect status", "status", w.status)
+		return
+	}
 	w.logger.Info("Starting")
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
@@ -101,6 +122,7 @@ func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
 	}()
 	go func() {
 		defer wg.Done()
+		ctx := context.Background()
 		for {
 			select {
 			case <-w.ctx.Done():
@@ -113,8 +135,13 @@ func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
 				}
 				job := <-jobs
 				w.logger.Info("working", "job", job)
-				ctx := context.Background()
 				fs, c, err := spt.FetchArtistTracks(w.client, ctx, spotify.ID(job))
+				if err == spotify.ErrMaxRetryDurationExceeded {
+					w.logger.Warn("Max retry duration exceeded, cold key")
+					w.status = coldKey
+					w.Stop()
+					return
+				}
 				helper.MaybeDie(err, "Failed to ferch artists tracks")
 				w.logger.Info("tracks fetched", "artist", job, "count", len(fs), "request_count", c)
 
@@ -135,9 +162,16 @@ func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
 			}
 		}
 	}()
+	w.status = running
 }
 
-func (s *Scraper) run() {
+func (w *Worker) Stop() {
+	w.logger.Info("stopping")
+	w.cancel()
+	w.status = stopped
+}
+
+func (s *Scraper) runWorkers() {
 	s.Wg.Add(len(s.workers))
 	for _, w := range s.workers {
 		w.Start(&s.Wg, s.Jobs)
@@ -145,7 +179,38 @@ func (s *Scraper) run() {
 	s.Wg.Wait()
 }
 
+func (s *Scraper) workerManage() {
+	s.Wg.Add(1)
+	defer s.Wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			slog.Info("stopped workerManager")
+			return
+		case <-ticker.C:
+			stp := 0
+			r := 0
+			for _, w := range s.workers {
+				switch w.status {
+				case stopped:
+					stp++
+				case running:
+					r++
+				}
+			}
+			slog.Info("worker pool state", "stopped", stp, "running", r)
+			if r == 0 {
+				go syscall.Kill(os.Getpid(), syscall.SIGINT)
+			}
+		}
+	}
+}
+
 func (s *Scraper) fetchJobs() {
+	s.Wg.Add(1)
+	defer s.Wg.Done()
 	ctx := context.Background()
 	for {
 		select {
