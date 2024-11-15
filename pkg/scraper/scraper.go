@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,7 +20,7 @@ import (
 )
 
 type Scraper struct {
-	Clients []*spotify.Client
+	Clients []*spt.Client
 	RDB     *redis.Client
 	Config  config.Scraper
 	Wg      sync.WaitGroup
@@ -30,7 +31,7 @@ type Scraper struct {
 }
 
 type Worker struct {
-	client       *spotify.Client
+	client       *spt.Client
 	id           string
 	logger       *slog.Logger
 	rdb          *redis.Client
@@ -50,11 +51,15 @@ const (
 	stopped
 )
 
-func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scraper) *Scraper {
+func NewScraper(clients []*spt.Client, rdb *redis.Client, conf config.Scraper) *Scraper {
 	ctx, cancel := context.WithCancel(context.Background())
 	ws := []*Worker{}
 
 	for i, c := range clients {
+		if c.Status == spt.Cold {
+			slog.Warn("Client is not ready for use", "name", c.Name, "status", c.Status.String(), "cooldown", c.Cooldown)
+			continue
+		}
 		name := fmt.Sprintf("%d", i)
 		logger := slog.With(slog.Group("worker"), slog.String("id", name))
 		workerCtx, workerCancel := context.WithCancel(ctx)
@@ -83,6 +88,11 @@ func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scrape
 }
 
 func (s *Scraper) Start() {
+	if len(s.workers) == 0 {
+		slog.Error("Can not start scraper with 0 workers")
+		go syscall.Kill(os.Getpid(), syscall.SIGINT)
+		return
+	}
 	slog.Info("Starting scraper")
 	ctx := context.Background()
 	err := database.RecoverInProgressTasks(s.RDB, ctx)
@@ -135,10 +145,13 @@ func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
 				}
 				job := <-jobs
 				w.logger.Info("working", "job", job)
-				fs, c, err := spt.FetchArtistTracks(w.client, ctx, spotify.ID(job))
-				if err == spotify.ErrMaxRetryDurationExceeded {
+				fs, c, err := w.client.FetchArtistTracks(ctx, spotify.ID(job))
+				var maxErr *spotify.MaxRetryDurationExceededErr
+				if errors.As(err, &maxErr) {
 					w.logger.Warn("Max retry duration exceeded, cold key")
 					w.status = coldKey
+					w.client.UpdateStatus(maxErr)
+					jobs <- job
 					w.Stop()
 					return
 				}

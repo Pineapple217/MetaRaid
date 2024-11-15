@@ -14,7 +14,7 @@ require (
 )
 
 // temp fix until merge and release
-replace github.com/zmb3/spotify/v2 => github.com/Pineapple217/spotify/v2 v2.4.4
+replace github.com/zmb3/spotify/v2 => /home/julesr/dev/spotify
 
 require (
 	github.com/apache/arrow-go/v18 v18.0.0 // indirect

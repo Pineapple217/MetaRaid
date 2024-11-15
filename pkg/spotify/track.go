@@ -8,6 +8,7 @@ import (
 type FullerTrack struct {
 	Track    *spotify.FullTrack
 	Features *spotify.AudioFeatures
+	Artists  []*spotify.FullArtist
 }
 
 func (f *FullerTrack) Serialize() ([]byte, error) {

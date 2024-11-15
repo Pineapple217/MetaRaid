@@ -46,7 +46,8 @@ func main() {
 		CREATE TABLE IF NOT EXISTS tracks (
 			track_id STRING,
 			name STRING,
-			artis STRING,
+			artist STRING,
+			artist_id STRING,
 			album STRING,
 			album_type STRING,
 			release_date DATE,
@@ -73,6 +74,13 @@ func main() {
 			preview_url STRING,
 			type STRING,
 			 -- playable BOOLEAN,
+
+			genres STRING[],
+			artist_follower INTEGER,
+			artist_popularity INTEGER,
+			artist_image_l STRING,
+			artist_image_m STRING,
+			artist_image_s STRING,
 		)
 	`)
 	if err != nil {
@@ -138,6 +146,7 @@ func Export(conn driver.Conn, rdb *redis.Client, ctx context.Context) error {
 				record.Track.ID.String(),
 				record.Track.Name,
 				record.Track.Artists[0].Name,
+				string(record.Track.Artists[0].ID),
 				record.Track.Album.Name,
 				record.Track.Album.AlbumType,
 				record.Track.Album.ReleaseDateTime(),
@@ -164,6 +173,13 @@ func Export(conn driver.Conn, rdb *redis.Client, ctx context.Context) error {
 				record.Track.PreviewURL,
 				record.Track.Type,
 				// record.Track.IsPlayable,
+
+				ExtractUniqueGenres(record.Artists),
+				int32(record.Artists[0].Followers.Count),
+				int32(record.Artists[0].Popularity),
+				GetImage(record.Artists[0].Images, 0),
+				GetImage(record.Artists[0].Images, 1),
+				GetImage(record.Artists[0].Images, 2),
 			)
 			helper.MaybeDieErr(err)
 		}
@@ -181,4 +197,28 @@ func GetImage(imgs []s.Image, i int) string {
 		return imgs[i].URL
 	}
 	return ""
+}
+
+func ExtractUniqueGenres(artists []*s.FullArtist) []string {
+	var uniqueGenres []string
+
+	for _, artist := range artists {
+		if artist == nil {
+			continue
+		}
+		for _, genre := range artist.Genres {
+			found := false
+			for _, uniqueGenre := range uniqueGenres {
+				if uniqueGenre == genre {
+					found = true
+					break
+				}
+			}
+			if !found {
+				uniqueGenres = append(uniqueGenres, genre)
+			}
+		}
+	}
+
+	return uniqueGenres
 }
