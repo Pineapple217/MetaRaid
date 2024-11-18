@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
+	"strings"
 
 	"github.com/Pineapple217/MetaRaid/pkg/config"
 	"github.com/Pineapple217/MetaRaid/pkg/helper"
+	spt "github.com/Pineapple217/MetaRaid/pkg/spotify"
 	"github.com/redis/go-redis/v9"
 	"github.com/zmb3/spotify/v2"
 )
@@ -25,114 +26,155 @@ func NewRedis(conf config.Redis) *redis.Client {
 	return rdb
 }
 
-func AddTask(rdb *redis.Client, ctx context.Context, task string) error {
-	err := rdb.Watch(ctx, func(tx *redis.Tx) error {
-		exists, err := tx.SIsMember(ctx, "processed_tasks", task).Result()
-		if err != nil {
-			return err
-		}
-		if exists {
-			slog.Debug("Task has already been processed, not adding", "task", task)
-			return nil
-		}
+var addJobsScript = redis.NewScript(`
+    local pendingKey = KEYS[1]
+    local results = {}
 
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.RPush(ctx, "task_queue", task)
-			return nil
-		})
+    for i, jobKey in ipairs(ARGV) do
+        local statusSet = redis.call("HSETNX", jobKey, "status", "pending")
+        if statusSet == 1 then
+            redis.call("SADD", pendingKey, jobKey)
+        end
+        results[i] = statusSet
+    end
 
-		if err == nil {
-			slog.Debug("Task added to the queue", "task", task)
-		}
+    return results
+`)
+
+func AddJobs(rdb *redis.Client, ctx context.Context, jobs []spotify.ID) error {
+	jobKeys := make([]string, len(jobs))
+	for i, job := range jobs {
+		jobKeys[i] = "jobs:" + job.String()
+	}
+
+	results, err := addJobsScript.Run(ctx, rdb, []string{"jobs_pending"}, jobKeys).Result()
+	if err != nil {
 		return err
-	}, "processed_tasks")
+	}
 
-	return err
+	for i, job := range jobs {
+		wasSet := results.([]any)[i].(int64)
+		if wasSet == 1 {
+			slog.Debug("job added to queue", "job", job.String())
+		} else {
+			slog.Debug("job already exists", "job", job.String())
+		}
+	}
+	return nil
 }
 
-func AddTasks(rdb *redis.Client, ctx context.Context, tasks []spotify.ID) error {
-	err := rdb.Watch(ctx, func(tx *redis.Tx) error {
-		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			for _, t := range tasks {
-				task := t.String()
-				exists, err := tx.SIsMember(ctx, "processed_tasks", task).Result()
-				if err != nil {
-					return err
-				}
-				if !exists {
-					pipe.RPush(ctx, "task_queue", task)
-					slog.Debug("Task added to the queue", "task", task)
-				} else {
-					slog.Debug("Task has already been processed, not adding", "task", task)
-				}
-			}
-			return nil
-		})
-		return err
-	}, "processed_tasks")
-
-	return err
-}
-
-func EnsureSeedTask(rdb *redis.Client, ctx context.Context, seedTask string) error {
-	queueLength, err := rdb.LLen(ctx, "task_queue").Result()
+func EnsureSeedJob(rdb *redis.Client, ctx context.Context, seedTask string) error {
+	queueLength, err := rdb.SCard(ctx, "jobs_pending").Result()
 	if err != nil {
 		return err
 	}
 
 	if queueLength == 0 {
-		slog.Info("Task queue is empty, adding seed task", "seed", seedTask)
-		return AddTask(rdb, ctx, seedTask)
+		slog.Info("job queue is empty, adding seed task", "seed", seedTask)
+		return AddJobs(rdb, ctx, []spotify.ID{spotify.ID(seedTask)})
 	}
 
-	slog.Info("Task queue is not empty, no seed task needed")
+	slog.Info("job queue is not empty, no seed job needed")
 	return nil
 }
 
-func GetTasks(rdb *redis.Client, ctx context.Context, count int) ([]string, error) {
-	var tasks []string
-	err := rdb.Watch(ctx, func(tx *redis.Tx) error {
-		// Peek at the first 'limit' tasks in the queue
-		taskList, err := tx.LRange(ctx, "task_queue", 0, int64(count-1)).Result()
-		if err != nil {
-			return err
-		}
-		if len(taskList) == 0 {
-			slog.Warn("No more tasks to process.")
-			time.Sleep(1000 * time.Millisecond)
-			return nil
-		}
+var popJobsScript = redis.NewScript(`
+    local pendingKey = KEYS[1]
+    local workingKey = KEYS[2]
+    local count = tonumber(ARGV[1])
+    local jobs = redis.call("SPOP", pendingKey, count)
 
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			for _, task := range taskList {
-				pipe.LPop(ctx, "task_queue")
-				pipe.SAdd(ctx, "in_progress_tasks", task)
-			}
-			return nil
-		})
+    if #jobs == 0 then
+        return {}
+    end
 
-		tasks = taskList
-		return err
-	}, "task_queue")
+    for i, job in ipairs(jobs) do
+        local jobKey = "jobs:" .. job
+        redis.call("HSET", jobKey, "status", "working")
+        redis.call("SADD", workingKey, job)
+    end
 
-	return tasks, err
+    return jobs
+`)
+
+func PopJobs(rdb *redis.Client, ctx context.Context, count int) ([]string, error) {
+	results, err := popJobsScript.Run(ctx, rdb, []string{"jobs_pending", "jobs_working"}, count).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var jobsOut []string
+	for _, job := range results.([]interface{}) {
+		jobsOut = append(jobsOut, strings.TrimPrefix(job.(string), "jobs:"))
+	}
+
+	return jobsOut, nil
 }
 
+var recoverInProgressTasksScript = redis.NewScript(`
+    local workingKey = KEYS[1]
+    local pendingKey = KEYS[2]
+    
+    -- Get all jobs in jobs_working
+    local jobs = redis.call("SMEMBERS", workingKey)
+    
+    if #jobs == 0 then
+        return 0  -- No jobs to recover
+    end
+
+    -- Move each job to jobs_pending and update status
+    for i, job in ipairs(jobs) do
+        redis.call("SADD", pendingKey, job)
+        redis.call("HSET", "jobs:" .. job, "status", "pending")
+    end
+
+    -- Remove all jobs from jobs_working
+    redis.call("DEL", workingKey)
+
+    return #jobs
+`)
+
 func RecoverInProgressTasks(rdb *redis.Client, ctx context.Context) error {
-	inProgressTasks, err := rdb.SMembers(ctx, "in_progress_tasks").Result()
+	result, err := recoverInProgressTasksScript.Run(ctx, rdb, []string{"jobs_working", "jobs_pending"}).Result()
 	if err != nil {
 		return err
 	}
 
-	for _, task := range inProgressTasks {
-		slog.Info("Recovering task back to the queue", "task", task)
-		if err := rdb.RPush(ctx, "task_queue", task).Err(); err != nil {
-			return err
-		}
-		if err := rdb.SRem(ctx, "in_progress_tasks", task).Err(); err != nil {
-			return err
-		}
+	if result.(int64) == 0 {
+		slog.Info("no jobs to recover")
+	} else {
+		slog.Info("recovered jobs", "count", result.(int64))
 	}
 
 	return nil
+}
+
+func MarkJobDone(rdb *redis.Client, ctx context.Context, job string) error {
+	pipe := rdb.TxPipeline()
+	pipe.SRem(ctx, "jobs_working", job)
+	pipe.SAdd(ctx, "jobs_done", job)
+	pipe.HSet(ctx, "jobs:"+job, "status", "done")
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return err
+	}
+	slog.Info("Marked task as done", "task", job)
+	return nil
+}
+
+func InsertTracks(rdb *redis.Client, ctx context.Context, tracks []*spt.FullerTrack) error {
+	pipe := rdb.Pipeline()
+
+	for _, track := range tracks {
+		key := "tracks:" + string(track.Track.ID)
+		serializedData, err := track.Serialize()
+		if err != nil {
+			return fmt.Errorf("failed to serialize data: %w", err)
+		}
+		pipe.Set(ctx, key, serializedData, 0)
+	}
+
+	_, err := pipe.Exec(ctx)
+	return err
 }

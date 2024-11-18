@@ -2,10 +2,13 @@ package scraper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Pineapple217/MetaRaid/pkg/config"
@@ -17,7 +20,7 @@ import (
 )
 
 type Scraper struct {
-	Clients []*spotify.Client
+	Clients []*spt.Client
 	RDB     *redis.Client
 	Config  config.Scraper
 	Wg      sync.WaitGroup
@@ -28,28 +31,46 @@ type Scraper struct {
 }
 
 type Worker struct {
-	client       *spotify.Client
+	client       *spt.Client
 	id           string
 	logger       *slog.Logger
 	rdb          *redis.Client
 	ctx          context.Context
+	cancel       context.CancelFunc
 	requestCount int64
 	trackCount   int64
+	status       status
 }
 
-func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scraper) *Scraper {
+type status int
+
+const (
+	initialized status = iota
+	running
+	coldKey
+	stopped
+)
+
+func NewScraper(clients []*spt.Client, rdb *redis.Client, conf config.Scraper) *Scraper {
 	ctx, cancel := context.WithCancel(context.Background())
 	ws := []*Worker{}
 
 	for i, c := range clients {
+		if c.Status == spt.Cold {
+			slog.Warn("Client is not ready for use", "name", c.Name, "status", c.Status.String(), "cooldown", c.Cooldown)
+			continue
+		}
 		name := fmt.Sprintf("%d", i)
 		logger := slog.With(slog.Group("worker"), slog.String("id", name))
+		workerCtx, workerCancel := context.WithCancel(ctx)
 		ws = append(ws, &Worker{
 			client: c,
 			id:     name,
 			logger: logger,
 			rdb:    rdb,
-			ctx:    ctx,
+			ctx:    workerCtx,
+			cancel: workerCancel,
+			status: initialized,
 		})
 	}
 
@@ -67,14 +88,20 @@ func NewScraper(clients []*spotify.Client, rdb *redis.Client, conf config.Scrape
 }
 
 func (s *Scraper) Start() {
+	if len(s.workers) == 0 {
+		slog.Error("Can not start scraper with 0 workers")
+		go syscall.Kill(os.Getpid(), syscall.SIGINT)
+		return
+	}
 	slog.Info("Starting scraper")
 	ctx := context.Background()
 	err := database.RecoverInProgressTasks(s.RDB, ctx)
 	helper.MaybeDieErr(err)
-	err = database.EnsureSeedTask(s.RDB, ctx, s.Config.SeedArtistId)
+	err = database.EnsureSeedJob(s.RDB, ctx, s.Config.SeedArtistId)
 	helper.MaybeDieErr(err)
 	go s.fetchJobs()
-	go s.run()
+	go s.runWorkers()
+	go s.workerManage()
 }
 
 func (s *Scraper) Stop() {
@@ -84,6 +111,10 @@ func (s *Scraper) Stop() {
 }
 
 func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
+	if w.status != initialized {
+		slog.Warn("Can not start worker, incorrect status", "status", w.status)
+		return
+	}
 	w.logger.Info("Starting")
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
@@ -101,30 +132,59 @@ func (w *Worker) Start(wg *sync.WaitGroup, jobs chan string) {
 	}()
 	go func() {
 		defer wg.Done()
-		for job := range jobs {
+		ctx := context.Background()
+		for {
 			select {
 			case <-w.ctx.Done():
 				w.logger.Info("stopped worker")
 				return
 			default:
+				if len(jobs) == 0 {
+					time.Sleep(time.Second)
+					continue
+				}
+				job := <-jobs
 				w.logger.Info("working", "job", job)
-				ctx := context.Background()
-				fs, c, err := spt.FetchArtistTracks(w.client, ctx, spotify.ID(job))
+				fs, c, err := w.client.FetchArtistTracks(ctx, spotify.ID(job))
+				var maxErr *spotify.MaxRetryDurationExceededErr
+				if errors.As(err, &maxErr) {
+					w.logger.Warn("Max retry duration exceeded, cold key")
+					w.status = coldKey
+					w.client.UpdateStatus(maxErr)
+					jobs <- job
+					w.Stop()
+					return
+				}
 				helper.MaybeDie(err, "Failed to ferch artists tracks")
 				w.logger.Info("tracks fetched", "artist", job, "count", len(fs), "request_count", c)
 
+				err = database.InsertTracks(w.rdb, ctx, fs)
+				helper.MaybeDie(err, "Failed to add tracks")
+
 				as := spt.GetArtists(fs, spotify.ID(job))
-				err = database.AddTasks(w.rdb, ctx, as)
+				err = database.AddJobs(w.rdb, ctx, as)
 				helper.MaybeDie(err, "Failed to add tasks")
 
 				atomic.AddInt64(&w.requestCount, int64(c))
 				atomic.AddInt64(&w.trackCount, int64(len(fs)))
+
+				err = database.MarkJobDone(w.rdb, ctx, job)
+				if err != nil {
+					w.logger.Error("Failed to mark job as done", "job", job)
+				}
 			}
 		}
 	}()
+	w.status = running
 }
 
-func (s *Scraper) run() {
+func (w *Worker) Stop() {
+	w.logger.Info("stopping")
+	w.cancel()
+	w.status = stopped
+}
+
+func (s *Scraper) runWorkers() {
 	s.Wg.Add(len(s.workers))
 	for _, w := range s.workers {
 		w.Start(&s.Wg, s.Jobs)
@@ -132,7 +192,38 @@ func (s *Scraper) run() {
 	s.Wg.Wait()
 }
 
+func (s *Scraper) workerManage() {
+	s.Wg.Add(1)
+	defer s.Wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			slog.Info("stopped workerManager")
+			return
+		case <-ticker.C:
+			stp := 0
+			r := 0
+			for _, w := range s.workers {
+				switch w.status {
+				case stopped:
+					stp++
+				case running:
+					r++
+				}
+			}
+			slog.Info("worker pool state", "stopped", stp, "running", r)
+			if r == 0 {
+				go syscall.Kill(os.Getpid(), syscall.SIGINT)
+			}
+		}
+	}
+}
+
 func (s *Scraper) fetchJobs() {
+	s.Wg.Add(1)
+	defer s.Wg.Done()
 	ctx := context.Background()
 	for {
 		select {
@@ -144,9 +235,15 @@ func (s *Scraper) fetchJobs() {
 				time.Sleep(time.Second)
 				continue
 			}
-			tasks, err := database.GetTasks(s.RDB, ctx, 5)
+			tasks, err := database.PopJobs(s.RDB, ctx, 5)
 			if err != nil {
 				slog.Warn("failed to fetch tasks", "error", err)
+			}
+			if len(tasks) == 0 {
+				slog.Info("no jobs to fetch, waiting", "sec", 3)
+				time.Sleep(time.Second * 3)
+			} else {
+				slog.Info("adding tracks to task queue", "count", len(tasks))
 			}
 			for _, task := range tasks {
 				s.Jobs <- task

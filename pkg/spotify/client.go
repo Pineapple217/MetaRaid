@@ -2,9 +2,10 @@ package spotify
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"slices"
+	"time"
 
 	"github.com/Pineapple217/MetaRaid/pkg/config"
 	"github.com/Pineapple217/MetaRaid/pkg/helper"
@@ -13,9 +14,34 @@ import (
 	"golang.org/x/oauth2/clientcredentials"
 )
 
-func NewClient(conf config.Spotify) []*spotify.Client {
+type Client struct {
+	Client   *spotify.Client
+	Status   status
+	Cooldown time.Duration
+	Name     string
+}
+
+type status int
+
+const (
+	Available status = iota
+	Cold
+)
+
+func (s status) String() string {
+	switch s {
+	case Available:
+		return "available"
+	case Cold:
+		return "cold"
+	default:
+		return "unknown"
+	}
+}
+
+func NewClient(conf config.Spotify) []*Client {
 	ctx := context.Background()
-	clients := []*spotify.Client{}
+	clients := []*Client{}
 	for _, keys := range conf.Clients {
 		config := &clientcredentials.Config{
 			ClientID:     keys.ClientId,
@@ -23,16 +49,48 @@ func NewClient(conf config.Spotify) []*spotify.Client {
 			TokenURL:     spotifyauth.TokenURL,
 		}
 		token, err := config.Token(ctx)
-		if err != nil {
-			helper.DieMsg(err, "could not get token")
-		}
+		helper.MaybeDie(err, "could not get token")
 
 		httpClient := spotifyauth.New().Client(ctx, token)
-		client := spotify.New(httpClient, spotify.WithRetry(true))
-		clients = append(clients, client)
+		client := spotify.New(
+			httpClient,
+			spotify.WithRetry(true),
+			spotify.WithMaxRetryDuration(conf.MaxRetryDuration),
+		)
+		c := Client{
+			Client: client,
+			Name:   keys.Name,
+		}
+		err = c.UpdateStatusAuto(ctx)
+		helper.MaybeDieErr(err)
+
+		clients = append(clients, &c)
 	}
 	slog.Info("Loaded Spotify api keys", "count", len(clients))
 	return clients
+}
+
+func (c *Client) UpdateStatusAuto(ctx context.Context) error {
+	_, err := c.Client.GetTrack(ctx, "0VjIjW4GlUZAMYd2vXMi3b")
+	var maxErr *spotify.MaxRetryDurationExceededErr
+	if err != nil {
+		if errors.As(err, &maxErr) {
+			c.Cooldown = maxErr.RetryAfter
+			c.Status = Cold
+			return nil
+		}
+		return err
+	}
+	c.Status = Available
+	return nil
+}
+
+func (c *Client) UpdateStatus(err *spotify.MaxRetryDurationExceededErr) {
+	if err == nil {
+		return
+	}
+	c.Cooldown = err.RetryAfter
+	c.Status = Cold
 }
 
 func GetArtists(fs []*FullerTrack, mainArtist spotify.ID) []spotify.ID {
@@ -53,9 +111,24 @@ func GetArtists(fs []*FullerTrack, mainArtist spotify.ID) []spotify.ID {
 	return out
 }
 
-func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.ID) ([]*FullerTrack, int, error) {
+func getAllArtists(fs *[]spotify.SimpleTrack) []spotify.ID {
+	seen := make(map[spotify.ID]struct{})
+	out := []spotify.ID{}
+	for _, t := range *fs {
+		for _, a := range t.Artists {
+			if _, exists := seen[a.ID]; !exists {
+				seen[a.ID] = struct{}{}
+				out = append(out, a.ID)
+			}
+
+		}
+	}
+	return out
+}
+
+func (c *Client) FetchArtistTracks(ctx context.Context, id spotify.ID) ([]*FullerTrack, int, error) {
 	requestCount := 0
-	albums, err := client.GetArtistAlbums(
+	albums, err := c.Client.GetArtistAlbums(
 		ctx,
 		id,
 		[]spotify.AlbumType{
@@ -65,7 +138,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 			// spotify.AlbumTypeAppearsOn,
 		}, spotify.Limit(50))
 	if err != nil {
-		return nil, requestCount, fmt.Errorf("hier %s", err)
+		return nil, requestCount, err
 	}
 	requestCount++
 
@@ -73,7 +146,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 	// cap to prevent infinite loop
 	for range 100 {
 		allAlbums = append(allAlbums, albums.Albums...)
-		err = client.NextPage(ctx, albums)
+		err = c.Client.NextPage(ctx, albums)
 		if err == spotify.ErrNoMorePages {
 			break
 		}
@@ -89,7 +162,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 		for i, a := range chunk {
 			ids[i] = a.ID
 		}
-		fullAlbums, err := client.GetAlbums(ctx, ids)
+		fullAlbums, err := c.Client.GetAlbums(ctx, ids)
 		if err != nil {
 			return nil, requestCount, err
 		}
@@ -98,7 +171,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 			tracks := fullAlbum.Tracks
 			for range 100 {
 				allSimpleTracks = append(allSimpleTracks, tracks.Tracks...)
-				err = client.NextPage(ctx, &tracks)
+				err = c.Client.NextPage(ctx, &tracks)
 				if err == spotify.ErrNoMorePages {
 					break
 				}
@@ -110,6 +183,19 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 		}
 	}
 
+	artistIds := getAllArtists(&allSimpleTracks)
+	allArtists := make(map[spotify.ID]*spotify.FullArtist)
+	for chunk := range slices.Chunk(artistIds, 50) {
+		r, err := c.Client.GetArtists(ctx, chunk...)
+		if err != nil {
+			return nil, requestCount, err
+		}
+		requestCount++
+		for _, a := range r {
+			allArtists[a.ID] = a
+		}
+	}
+
 	allTracks := make([]*FullerTrack, len(allSimpleTracks))
 	offset := 0
 	for chunk := range slices.Chunk(allSimpleTracks, 100) {
@@ -118,7 +204,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 			ids[i] = a.ID
 		}
 
-		f, err := client.GetAudioFeatures(ctx, ids...)
+		features, err := c.Client.GetAudioFeatures(ctx, ids...)
 		if err != nil {
 			return nil, requestCount, err
 		}
@@ -126,7 +212,7 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 
 		fullTracks := []*spotify.FullTrack{}
 		for subChunk := range slices.Chunk(ids, 50) {
-			full, err := client.GetTracks(ctx, subChunk, spotify.Limit(50))
+			full, err := c.Client.GetTracks(ctx, subChunk, spotify.Limit(50))
 			if err != nil {
 				return nil, 0, err
 			}
@@ -134,10 +220,14 @@ func FetchArtistTracks(client *spotify.Client, ctx context.Context, id spotify.I
 			fullTracks = append(fullTracks, full...)
 		}
 		for i := range len(ids) {
-			allTracks[i+offset] = &FullerTrack{
+			ft := &FullerTrack{
 				Track:    fullTracks[i],
-				Features: f[i],
+				Features: features[i],
 			}
+			for _, a := range ft.Track.Artists {
+				ft.Artists = append(ft.Artists, allArtists[a.ID])
+			}
+			allTracks[i+offset] = ft
 		}
 		offset += 100
 	}
